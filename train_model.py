@@ -4,51 +4,106 @@ import shutil
 from collections import Counter
 from pathlib import Path
 
-import nfp
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+from tensorflow import keras
 import tensorflow_addons as tfa
+#import nfp
+from nfp import EdgeUpdate, NodeUpdate
 from nfp.layers import RBFExpansion
 from nfp.preprocessing.crystal_preprocessor import PymatgenPreprocessor
 from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.keras import layers
 from tqdm.auto import tqdm
 
 tqdm.pandas()
 
-inputs_dir = Path("/projects/rlmolecule/pstjohn/crystal_inputs/")
+# Some of these metrics work only on values in a range 0-1, 
+# even if from_logits=True is set
+# https://github.com/tensorflow/tensorflow/issues/42182#issuecomment-818777681
+class FromLogitsMixin:
+    def __init__(self, from_logits=False, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.from_logits = from_logits
 
-data = pd.read_pickle(Path(inputs_dir, "20211227_all_data.p"))
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        if self.from_logits:
+            y_pred = tf.nn.sigmoid(y_pred)
+        return super().update_state(y_true, y_pred, sample_weight)
+
+
+class AUC(FromLogitsMixin, tf.metrics.AUC):
+    ...
+
+class BinaryAccuracy(FromLogitsMixin, tf.metrics.BinaryAccuracy):
+    ...
+
+class TruePositives(FromLogitsMixin, tf.metrics.TruePositives):
+    ...
+
+class FalsePositives(FromLogitsMixin, tf.metrics.FalsePositives):
+    ...
+
+class TrueNegatives(FromLogitsMixin, tf.metrics.TrueNegatives):
+    ...
+
+class FalseNegatives(FromLogitsMixin, tf.metrics.FalseNegatives):
+    ...
+
+class Precision(FromLogitsMixin, tf.metrics.Precision):
+    ...
+
+class Recall(FromLogitsMixin, tf.metrics.Recall):
+    ...
+
+class F1Score(FromLogitsMixin, tfa.metrics.F1Score):
+    ...
+
+
+METRICS = [
+      TruePositives(name='tp', from_logits=True),
+      FalsePositives(name='fp', from_logits=True),
+      TrueNegatives(name='tn', from_logits=True),
+      FalseNegatives(name='fn', from_logits=True), 
+      BinaryAccuracy(name='accuracy', from_logits=True),
+      Precision(name='precision', from_logits=True),
+      Recall(name='recall', from_logits=True),
+      AUC(name='auroc', from_logits=True),
+      AUC(name='auprc', curve='PR', from_logits=True), # precision-recall curve
+]
+
+#inputs_dir = Path("/projects/rlmolecule/pstjohn/crystal_inputs/")
+inputs_dir = Path("outputs/20220205_cos_dist_bins")
+
+bin_cutoff = "0_05"
+train_col = f"dist_class_{bin_cutoff}"
+run_id = f"model_b64_{train_col}"
+
+model_dir = Path(inputs_dir, run_id)
+
+data = pd.read_pickle(Path(inputs_dir, "all_data.p"))
 preprocessor = PymatgenPreprocessor()
-preprocessor.from_json(Path(inputs_dir, "20211227_preprocessor.json"))
+preprocessor.from_json(Path(inputs_dir, "preprocessor.json"))
 
-train, valid = train_test_split(data, test_size=2000, random_state=1)
+train, valid = train_test_split(data, test_size=.1, random_state=1)
 valid, test = train_test_split(valid, test_size=0.5)
 
 
 def calculate_output_bias(train):
-    """ We can get a reasonable guess for the output bias by just assuming the crystal's
-     energy is a linear sum over it's element types """
-    # This just converts to a count of each element by crystal
-    site_counts = train.inputs.progress_apply(
-        lambda x: pd.Series(Counter(x["site"]))
-    ).fillna(0)
-    # Linear regression assumes a sum, while we average over sites in the neural network.
-    # Here, we make the regression target the total energy, not the site-averaged energy
-    num_sites = site_counts.sum(1)
-    total_energies = train["energyperatom"] * num_sites
-
-    # Do the least-squares regression, and stack on zeros for the mask and unknown tokens
-    output_bias = np.linalg.lstsq(site_counts, total_energies, rcond=None)[0]
-    output_bias = np.hstack([np.zeros(2), output_bias])
-    return output_bias
+    """ Try setting the initial bias
+    """
+    num_pos = len(train[train[train_col] == 1])
+    num_neg = len(train[train[train_col] == 0])
+    initial_bias = np.log([num_pos / num_neg])
+    return initial_bias
 
 
 def build_dataset(split, batch_size):
     return (
         tf.data.Dataset.from_generator(
-            lambda: ((row.inputs, row.energyperatom) for _, row in split.iterrows()),
+            lambda: ((row.inputs, row[train_col]) for _, row in split.iterrows()),
             output_signature=(
                 preprocessor.output_signature,
                 tf.TensorSpec((), dtype=tf.float32),
@@ -103,9 +158,9 @@ rbf_distance = RBFExpansion(
 bond_state = layers.Dense(embed_dimension)(rbf_distance)
 
 for _ in range(num_messages):
-    new_bond_state = nfp.EdgeUpdate()([atom_state, bond_state, connectivity])
+    new_bond_state = EdgeUpdate()([atom_state, bond_state, connectivity])
     bond_state = layers.Add()([bond_state, new_bond_state])
-    new_atom_state = nfp.NodeUpdate()([atom_state, bond_state, connectivity])
+    new_atom_state = NodeUpdate()([atom_state, bond_state, connectivity])
     atom_state = layers.Add()([atom_state, new_atom_state])
 
 # Reduce the atom state vector to a single energy prediction
@@ -140,21 +195,30 @@ optimizer = tfa.optimizers.AdamW(
     learning_rate=lr_schedule, weight_decay=wd_schedule, global_clipnorm=1.0
 )
 
-model.compile(loss="mae", optimizer=optimizer)
+#loss = 'mae'
+loss = tf.keras.losses.BinaryCrossentropy(from_logits=True)
 
-model_name = "20211227_icsd_and_battery"
+#weights = dict(zip(np.unique(train[train_col]), 
+#                   compute_class_weight('balanced', 
+#                                        classes=np.unique(train[train_col]), 
+#                                        y=train[train_col])))
+#print('Setting class weights: ', weights)
 
-if not os.path.exists(model_name):
-    os.makedirs(model_name)
+model.compile(loss=loss, optimizer=optimizer, metrics=METRICS)
+
+if not os.path.exists(model_dir):
+    os.makedirs(model_dir)
 
 # Make a backup of the job submission script
-shutil.copy(__file__, model_name)
+dest_file = Path(model_dir, os.path.basename(__file__))
+if not dest_file.is_file() or Path(__file__) != dest_file:
+    shutil.copy(__file__, dest_file)
 
-filepath = model_name + "/best_model.hdf5"
+filepath = Path(model_dir, "best_model.hdf5")
 checkpoint = tf.keras.callbacks.ModelCheckpoint(
     filepath, save_best_only=True, verbose=0
 )
-csv_logger = tf.keras.callbacks.CSVLogger(model_name + "/log.csv")
+csv_logger = tf.keras.callbacks.CSVLogger(Path(model_dir, "log.csv"))
 
 if __name__ == "__main__":
     model.fit(
@@ -162,5 +226,6 @@ if __name__ == "__main__":
         validation_data=valid_dataset,
         epochs=100,
         callbacks=[checkpoint, csv_logger],
+        #class_weight=weights,
         verbose=1,
     )
