@@ -242,10 +242,10 @@ if __name__ == "__main__":
     model.fit(
         train_dataset,
         validation_data=valid_dataset,
-        steps_per_epoch=math.ceil(len(train)/batch_size),
-        validation_steps=math.ceil(len(valid)/batch_size),
         # make sure each model trains on the same amount data
-        epochs=int((orig_num_train / len(train)) * 100),
+        steps_per_epoch=STEPS_PER_EPOCH,
+        validation_steps=math.ceil(len(valid)/batch_size),
+        epochs=100,
         callbacks=[checkpoint, csv_logger],
         verbose=1,
     )
