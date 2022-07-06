@@ -250,6 +250,7 @@ if __name__ == "__main__":
         verbose=1,
     )
 
+    data = pd.concat([train, valid, test, test_composition])
     data["set"] = "train"
     data.loc[data.index.isin(valid.index), "set"] = "valid"
     data.loc[data.index.isin(test.index), "set"] = "test"
