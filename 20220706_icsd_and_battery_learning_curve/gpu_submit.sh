@@ -4,19 +4,21 @@
 #SBATCH --job-name=crystal_gnn_lc
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:2
-#SBATCH --output=gpu_model.%j.out
-#SBATCH --qos=high
+#SBATCH --output=/scratch/jlaw/gpu_model_lc.%j.out
+##SBATCH --qos=high
 
 source ~/.bashrc
 module load cudnn/8.1.1/cuda-11.2
 module load gcc
 conda activate /home/jlaw/.conda-envs/crystals_nfp0_3
+
 run_id=1
 
 srun -l hostname
 
 for ((i = 0 ; i < 10 ; i++)); do
-    srun -l -n 1 --gres=gpu:1 --nodes=1 python train_model.py $run_id $i &
+    srun --gres=gpu:1 --nodes=1 --ntasks=1 --cpus-per-task=4 --exclusive \
+        python train_model.py $run_id $i &
 done
 
 wait

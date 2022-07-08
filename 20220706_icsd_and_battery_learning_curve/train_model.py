@@ -68,25 +68,18 @@ print(f"read {len(data)} structures from {data_file}")
 print(data.head(2))
 max_atomic_num = 84
 
-# --- Read the test set from file to make sure its consistent ---
-splits_file = "splits.csv.gz"
-print(f"reading {splits_file}")
-df_splits = pd.read_csv(splits_file)
-print(df_splits.set.value_counts())
+composition_set = data.composition.isin(
+    pd.Series(data.composition.unique()).sample(100, random_state=runid)
+)
+test_composition = data[composition_set]
+train_composition = data[~composition_set]
 
-data_subset = {}
-for split, df in df_splits.groupby('set'):
-    df_types = []
-    for data_type, df2 in df.groupby('type'):
-        df_sub = data[(data.type == data_type) & (data.id.isin(df2.id))]
-        df_types += [df_sub]
-    data_subset[split] = pd.concat(df_types)
-
-test_composition = data_subset['test_composition']
-test = data_subset['test']
-
-test_set = set(test_composition.id) | set(test.id)
-train = data[~data.id.isin(test_set)]
+train, test = train_test_split(
+    train_composition,
+    test_size=1500,
+    random_state=runid,
+    stratify=train_composition["type"],
+)
 
 # now subset to the specified number of training examples
 orig_num_valid = len(train) * .05
